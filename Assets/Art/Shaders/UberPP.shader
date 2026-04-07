@@ -327,14 +327,16 @@ Shader "Artificial Artists/Universal Render Pipeline/AA_UberPost"
                 return half4(color, min(alpha, alpha_mask));
             }
 
-            return YargVenuePP(color, uvDistorted, uv);
-
-            // #if _ENABLE_ALPHA_OUTPUT
-            // // Saturate is necessary to avoid issues when additive blending pushes the alpha over 1.
-            // return half4(color, saturate(inputColor.a));
-            // #else
-            // return half4(color, 1);
-            // #endif
+            if (_YargIsVenue > 0)
+            {
+                return YargVenuePP(color, uvDistorted, uv);
+            }
+#if _ENABLE_ALPHA_OUTPUT
+            // Saturate is necessary to avoid issues when additive blending pushes the alpha over 1.
+            return half4(color, saturate(inputColor.a));
+#else
+            return half4(color, 1.0);
+#endif
         }
 
     ENDHLSL
