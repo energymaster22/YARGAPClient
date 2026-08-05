@@ -3,8 +3,10 @@ using System.Linq;
 using System.Collections.Generic;
 using System.Threading;
 using Cysharp.Threading.Tasks;
+using DG.Tweening;
 using TMPro;
 using UnityEngine;
+using UnityEngine.Serialization;
 using UnityEngine.UI;
 using YARG.Core;
 using YARG.Core.Audio;
@@ -47,12 +49,15 @@ namespace YARG.Menu.ScoreScreen
         private StarView _bandStarView;
         [SerializeField]
         private TextMeshProUGUI _bandScore;
+        [FormerlySerializedAs("_bandScoreNotSavedPill")]
         [SerializeField]
-        private ColoredPillElement _bandScoreNotSavedPill;
+        private ColoredPillElement _scoreStatusPill;
         [SerializeField]
         private ScrollRect _cardScrollRect;
         [SerializeField]
-        private float _horizontalScrollRate = 30f;
+        private float _horizontalScrollDuration = 0.25f;
+        [SerializeField]
+        private Ease _horizontalScrollEase = Ease.OutCubic;
         [SerializeField]
         private float _verticalScrollRate = 15f;
 
@@ -66,18 +71,26 @@ namespace YARG.Menu.ScoreScreen
         [SerializeField]
         private ProKeysScoreCard _keysCardPrefab;
 
+        private enum ScrollDirection
+        {
+            Left,
+            Right
+        }
+
         private bool _analyzingReplay;
         private bool _restartingSong;
         private bool _showAdvancedStats;
+
+        private float                   _horizontalScrollStep;
+        private Tween                   _horizontalScrollTween;
         private CancellationTokenSource _cancellationToken;
 
         private readonly List<IScoreCard<BaseStats>> _scoreCards = new();
 
+
         private void OnEnable()
         {
             var song = GlobalVariables.State.CurrentSong;
-
-            SetNavigationScheme();
 
             if (GlobalVariables.State.ScoreScreenStats is null)
             {
@@ -87,32 +100,10 @@ namespace YARG.Menu.ScoreScreen
 
             var scoreScreenStats = GlobalVariables.State.ScoreScreenStats.Value;
 
-#if UNITY_EDITOR || YARG_NIGHTLY_BUILD || YARG_TEST_BUILD
-            // Do analysis of replay before showing any score data
-            // This will make it so that if the analysis takes a while the screen is blank
-            // (kinda like a loading screen)
-            try
-            {
-                if (!AnalyzeReplay(song, scoreScreenStats.ReplayInfo))
-                {
-                    DialogManager.Instance.ShowMessage("Inconsistent Replay Results!",
-                        "The replay analysis for this run produced inconsistent results to the actual gameplay.\n" +
-                        "Please report this issue to the YARG developers on GitHub or Discord.\n\n" +
-                        $"Chart Hash: {song.Hash}");
-                }
-            }
-            catch (Exception ex)
-            {
-                YargLogger.LogException(ex, $"Failed to analyze replay! Song hash: {song.Hash}");
-                DialogManager.Instance.ShowMessage("Failed To Analyze Replay!",
-                    "The replay analysis for this run resulted in an unexpected error.\n" +
-                    "Please report this issue to the YARG developers on GitHub or Discord.\n\n" +
-                    $"Chart Hash: {song.Hash}");
-            }
-#endif
+            ShowReplayAnalysis(song, scoreScreenStats);
 
-            // Play audience chatter
-            if (SettingsManager.Settings.UseCrowdFx.Value == CrowdFxMode.Enabled)
+        // Play audience chatter, unless we are viewing a replay score
+        if (SettingsManager.Settings.UseCrowdFx.Value == CrowdFxMode.Enabled && !GlobalVariables.State.IsReplay)
             {
                 GlobalAudioHandler.PlaySoundEffect(SfxSample.Chatter, 1.0);
             }
@@ -120,13 +111,24 @@ namespace YARG.Menu.ScoreScreen
             // Set text
             _songTitle.text = song.Name;
             _artistName.text = song.Artist;
-
-            var scoreNotSavedText = Localize.Key("Menu.ScoreScreen.BandScoreNotSaved");
-            _bandScoreNotSavedPill.SetValues(scoreNotSavedText,
-                ColoredPillElement.ColoredPillPreset.HarderModifier);
-            _bandScoreNotSavedPill.gameObject.SetActive(
-                !ScoreContainer.IsBandScoreValid(PersistentState.Default.SongSpeed));
-
+            if (!GlobalVariables.State.IsReplay && !ScoreContainer.IsBandScoreValid(PersistentState.Default.SongSpeed))
+            {
+                var text = Localize.Key("Menu.ScoreScreen.BandScoreNotSaved");
+                _scoreStatusPill.SetValues(text,
+                    ColoredPillElement.ColoredPillPreset.HarderModifier);
+                _scoreStatusPill.gameObject.SetActive(true);
+            }
+            else if (GlobalVariables.State.IsReplay && GlobalVariables.State.ScoreScreenStats is {ReplayWasConsistent: false})
+            {
+                var text = Localize.Key("Menu.ScoreScreen.InconsistentReplay");
+                _scoreStatusPill.SetValues(text,
+                    ColoredPillElement.ColoredPillPreset.HarderModifier);
+                _scoreStatusPill.gameObject.SetActive(true);
+            }
+            else
+            {
+                _scoreStatusPill.gameObject.SetActive(false);
+            }
             // Set speed text (if not at 100% speed)
             if (!Mathf.Approximately(GlobalVariables.State.SongSpeed, 1f))
             {
@@ -141,6 +143,8 @@ namespace YARG.Menu.ScoreScreen
 
             // Put the scores in!
             CreateScoreCards(scoreScreenStats);
+
+            SetNavigationScheme();
 
             _sourceIcon.sprite = SongSources.SourceToIcon(song.Source);
 
@@ -159,10 +163,9 @@ namespace YARG.Menu.ScoreScreen
                 GlobalVariables.State = PersistentState.Default;
             }
 
-            if (SettingsManager.Settings.UseCrowdFx.Value == CrowdFxMode.Enabled)
-            {
-                GlobalAudioHandler.StopSoundEffect(SfxSample.Chatter, 1.0);
-            }
+            GlobalAudioHandler.StopSoundEffect(SfxSample.Chatter, 1.0);
+
+            KillScrollTween();
 
             _cancellationToken?.Cancel();
             _cancellationToken?.Dispose();
@@ -197,7 +200,7 @@ namespace YARG.Menu.ScoreScreen
                     case GameMode.FiveFretGuitar:
                     {
                         card = Instantiate(_guitarCardPrefab, _cardContainer);
-                        ((ScoreCard<GuitarStats>)card).Initialize(score.IsHighScore, score.Player, score.Stats as GuitarStats, score.AverageMultiplier);
+                        ((ScoreCard<GuitarStats>)card).Initialize(score.IsHighScore, score.Player, score.Stats as GuitarStats, score.IsReplay);
                         break;
                     }
                     case GameMode.FourLaneDrums:
@@ -205,19 +208,19 @@ namespace YARG.Menu.ScoreScreen
                     case GameMode.EliteDrums:
                     {
                         card = Instantiate(_drumsCardPrefab, _cardContainer);
-                        ((ScoreCard<DrumsStats>)card).Initialize(score.IsHighScore, score.Player, score.Stats as DrumsStats, score.AverageMultiplier);
+                        ((ScoreCard<DrumsStats>)card).Initialize(score.IsHighScore, score.Player, score.Stats as DrumsStats, score.IsReplay);
                         break;
                     }
                     case GameMode.Vocals:
                     {
                         card = Instantiate(_vocalsCardPrefab, _cardContainer);
-                        ((ScoreCard<VocalsStats>)card).Initialize(score.IsHighScore, score.Player, score.Stats as VocalsStats, score.AverageMultiplier);
+                        ((ScoreCard<VocalsStats>)card).Initialize(score.IsHighScore, score.Player, score.Stats as VocalsStats, score.IsReplay);
                         break;
                     }
                     case GameMode.ProKeys:
                     {
                         card = Instantiate(_keysCardPrefab, _cardContainer);
-                        ((ScoreCard<KeysStats>) card).Initialize(score.IsHighScore, score.Player, score.Stats as KeysStats, score.AverageMultiplier);
+                        ((ScoreCard<KeysStats>) card).Initialize(score.IsHighScore, score.Player, score.Stats as KeysStats, score.IsReplay);
                         break;
                     }
                 }
@@ -239,14 +242,31 @@ namespace YARG.Menu.ScoreScreen
             // If the scroll bar is active, make it all the way to the left
             InitializeScrollRect();
 
-            // As a final bonus, play the appropriate full combo/high score vox samples
-            PlayScoreVox(fcCount, highScoreCount);
+            // As a final bonus, play the appropriate full combo/high score vox samples, if we are not in a replay
+            if (!GlobalVariables.State.IsReplay)
+            {
+                PlayScoreVox(fcCount, highScoreCount);
+            }
+        }
+
+        private void KillScrollTween()
+        {
+            _horizontalScrollTween?.Kill();
+            _horizontalScrollTween = null;
         }
 
         private async void InitializeScrollRect()
         {
-            await UniTask.Yield(PlayerLoopTiming.LastPostLateUpdate);
+            KillScrollTween();
             _cardScrollRect.horizontalNormalizedPosition = 0f;
+            SetupScrollStep();
+        }
+
+        private void SetupScrollStep()
+        {
+            var cardRect = _cardContainer.GetChild(0) as RectTransform;
+            var layoutGroup = _cardContainer.GetComponent<HorizontalLayoutGroup>();
+            _horizontalScrollStep = cardRect.rect.width + layoutGroup.spacing;
         }
 
         private static void PlayScoreVox(int fcCount, int highScoreCount)
@@ -389,6 +409,7 @@ namespace YARG.Menu.ScoreScreen
         private NavigationScheme.Entry _continueButtonEntry;
         private NavigationScheme.Entry _endEarlyButtonEntry;
         private NavigationScheme.Entry _restartButtonEntry;
+        private NavigationScheme.Entry _viewReplayButtonEntry;
         private NavigationScheme.Entry _showAdvancedButtonEntry;
         private NavigationScheme.Entry _removeFavoriteButtonEntry;
         private NavigationScheme.Entry _addFavoriteButtonEntry;
@@ -400,7 +421,6 @@ namespace YARG.Menu.ScoreScreen
         private void SetNavigationScheme()
         {
             var song = GlobalVariables.State.CurrentSong;
-
             _continueButtonEntry = new NavigationScheme.Entry(MenuAction.Green, "Menu.Common.Continue", () =>
                 {
                     if (!_analyzingReplay)
@@ -416,6 +436,11 @@ namespace YARG.Menu.ScoreScreen
                         }
                         else
                         {
+                            if (GlobalVariables.State.IsReplay)
+                            {
+                                GlobalVariables.State.CurrentReplay = null;
+                            }
+
                             GlobalVariables.State.PlayingAShow = false;
                             GlobalVariables.Instance.LoadScene(SceneIndex.Menu);
                         }
@@ -426,6 +451,14 @@ namespace YARG.Menu.ScoreScreen
             {
                 GlobalVariables.State.PlayingAShow = false;
                 GlobalVariables.Instance.LoadScene(SceneIndex.Menu);
+            });
+
+            _viewReplayButtonEntry = new NavigationScheme.Entry(MenuAction.Yellow, "Menu.ScoreScreen.ViewReplay", () =>
+            {
+                        _restartingSong = true;
+                        // Not null, isReplay is only true if CurrentReplay is defined.
+                        GlobalVariables.State.SongSpeed = GlobalVariables.State.CurrentReplay!.SongSpeed;
+                        GlobalVariables.Instance.LoadScene(SceneIndex.Gameplay);
             });
 
             _restartButtonEntry = new NavigationScheme.Entry(MenuAction.Yellow, "Menu.ScoreScreen.RestartSong", () =>
@@ -452,12 +485,12 @@ namespace YARG.Menu.ScoreScreen
 
             _scrollLeftEntry = new NavigationScheme.Entry(MenuAction.Left, "Menu.Common.Scroll", context =>
                 {
-                    _cardScrollRect.MoveHorizontalInUnits(-1 * _horizontalScrollRate);
+                    ScrollScoresHorizontal(ScrollDirection.Left, context.IsRepeat);
                 });
 
             _scrollRightEntry = new NavigationScheme.Entry(MenuAction.Right, "Menu.Common.Scroll", context =>
                 {
-                    _cardScrollRect.MoveHorizontalInUnits(_horizontalScrollRate);
+                    ScrollScoresHorizontal(ScrollDirection.Right, context.IsRepeat);
                 });
 
             _scrollUpEntry = new NavigationScheme.Entry(MenuAction.Up, "Menu.Common.Scroll", context =>
@@ -471,6 +504,43 @@ namespace YARG.Menu.ScoreScreen
                 });
 
             UpdateNavigationScheme();
+        }
+        private void ScrollScoresHorizontal(ScrollDirection direction, bool isHeld)
+        {
+            float scrollableWidth = _cardScrollRect.ScrollableWidth();
+            bool canScroll = scrollableWidth > 0f;
+            if (!canScroll)
+            {
+                return;
+            }
+
+            // If dpad is held, ignore repeated inputs while tween is active
+            bool isTweenActive = _horizontalScrollTween != null;
+            if (isHeld && isTweenActive)
+            {
+                return;
+            }
+
+            float startPos = _cardScrollRect.horizontalNormalizedPosition;
+            float directionMultiplier = direction == ScrollDirection.Right ? 1f : -1f;
+            float targetPos = Mathf.Clamp(startPos + directionMultiplier * _horizontalScrollStep / scrollableWidth, 0f, 1f);
+
+            if (targetPos == startPos)
+            {
+                return;
+            }
+
+            SmoothScrollTo(targetPos);
+        }
+
+        private void SmoothScrollTo(float targetPos)
+        {
+            KillScrollTween();
+            _horizontalScrollTween = _cardScrollRect
+                .DOHorizontalNormalizedPos(targetPos, _horizontalScrollDuration)
+                .SetEase(_horizontalScrollEase)
+                .SetUpdate(true)
+                .OnComplete(() => _horizontalScrollTween = null);
         }
 
         private void ScrollScoreCard(Player.YargPlayer player, float delta)
@@ -508,11 +578,20 @@ namespace YARG.Menu.ScoreScreen
             List<NavigationScheme.Entry> buttons = new()
             {
                 _continueButtonEntry,
-                _restartButtonEntry
             };
 
+            var isReplay = GlobalVariables.State.IsReplay;
             var song = GlobalVariables.State.CurrentSong;
             var isFavorited = PlaylistContainer.FavoritesPlaylist.ContainsSong(song);
+
+            if (isReplay)
+            {
+                buttons.Add(_viewReplayButtonEntry);
+            }
+            else
+            {
+                buttons.Add(_restartButtonEntry);
+            }
 
             if (isFavorited)
             {
@@ -523,7 +602,10 @@ namespace YARG.Menu.ScoreScreen
                 buttons.Add(_addFavoriteButtonEntry);
             }
 
-            buttons.Add(_showAdvancedButtonEntry);
+            if (_scoreCards.Any(card => card is not ScoreCard<VocalsStats>))
+            {
+                buttons.Add(_showAdvancedButtonEntry);
+            }
 
             if (GlobalVariables.State.PlayingAShow &&
                 GlobalVariables.State.ShowIndex + 1 < GlobalVariables.State.ShowSongs.Count)
@@ -535,7 +617,35 @@ namespace YARG.Menu.ScoreScreen
             buttons.Add(_scrollRightEntry);
             buttons.Add(_scrollUpEntry);
             buttons.Add(_scrollDownEntry);
-            Navigator.Instance.PushScheme(new(buttons, true));
+            _ = Navigator.Instance.PushScheme(new(buttons, true));
+        }
+
+        private void ShowReplayAnalysis(SongEntry song, ScoreScreenStats scoreScreenStats)
+        {
+#if UNITY_EDITOR || YARG_NIGHTLY_BUILD || YARG_TEST_BUILD
+            if (GlobalVariables.State.IsReplay)
+            {
+                return;
+            }
+            try
+            {
+                if (!AnalyzeReplay(song, scoreScreenStats.ReplayInfo))
+                {
+                    var dialog = DialogManager.Instance.ShowMessage("Inconsistent Replay Results!",
+                        "The replay analysis for this run produced inconsistent results to the actual gameplay.\n" +
+                        "Please report this issue to the YARG developers on GitHub or Discord.\n\n" +
+                        $"Chart Hash: {song.Hash}");
+                }
+            }
+            catch (Exception ex)
+            {
+                YargLogger.LogException(ex, $"Failed to analyze replay! Song hash: {song.Hash}");
+                DialogManager.Instance.ShowMessage("Failed To Analyze Replay!",
+                    "The replay analysis for this run resulted in an unexpected error.\n" +
+                    "Please report this issue to the YARG developers on GitHub or Discord.\n\n" +
+                    $"Chart Hash: {song.Hash}");
+            }
+#endif
         }
     }
 }

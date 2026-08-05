@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using Cysharp.Threading.Tasks;
@@ -6,8 +6,10 @@ using UnityEngine;
 using YARG.Core;
 using YARG.Core.Audio;
 using YARG.Core.Chart;
+using YARG.Core.Engine;
 using YARG.Core.Logging;
 using YARG.Core.Replays;
+using YARG.Gameplay.HUD;
 using YARG.Gameplay.Player;
 using YARG.Menu;
 using YARG.Menu.Navigation;
@@ -46,9 +48,11 @@ namespace YARG.Gameplay
         [SerializeField]
         private GameObject _proGuitarPrefab;
 
+        private const double NORMALIZED_SAMPLE_VOLUME_MULTIPLIER = 0.5;
+        private const double DEFAULT_SAMPLE_VOLUME_MULTIPLIER = 1.0;
+
         private LoadFailureState _loadState;
         private string _loadFailureMessage;
-
         // All access to chart data must be done through this event,
         // since things are loaded asynchronously
         // Players are initialized by hand and don't go through this event
@@ -106,6 +110,8 @@ namespace YARG.Gameplay
 
             // Disable until everything's loaded
             enabled = false;
+
+            ApplySampleNormalization();
 
             YargLogger.LogFormatInfo("Loading song {0} - {1}", Song.Name, Song.Artist);
 
@@ -191,8 +197,20 @@ namespace YARG.Gameplay
                 GlobalVariables.State.SongSpeed,
                 Song.SongOffsetSeconds);
 
+            _metronomeScheduler = new MetronomeScheduler(_mixer);
+            _metronomeScheduler.Schedule(_songRunner, Chart.SyncTrack, SongLength);
+
+            _crowdClapScheduler = new CrowdClapScheduler(_mixer);
+            _crowdClapScheduler.Schedule(_songRunner, Chart.SyncTrack, Chart.CrowdEvents,
+                FirstNoteTime, LastNoteTime, SongLength);
+            CrowdEventHandler.SetClapScheduler(_crowdClapScheduler);
+
             // Spawn players
             CreatePlayers();
+            YargLogger.LogFormatDebug("Calculating star cutoffs for {0} players", _players.Count);
+            EngineManager.StarScoreThresholds = EngineManager.GetStarScoreCutoffs(_players.ConvertAll(p => p.BaseEngine.StarScoreThresholds));
+            YargLogger.LogFormatDebug("Star score thresholds: {0}", string.Join(", ", EngineManager.StarScoreThresholds));
+
 
             // Set up the crowd stem so it can be restored after muting (if it exists)
             if (_stemStates.TryGetValue(SongStem.Crowd, out var state))
@@ -230,7 +248,7 @@ namespace YARG.Gameplay
 
             _failMeter.Initialize(EngineManager, this);
 
-            if (SettingsManager.Settings.NoFailMode.Value || IsPractice)
+            if (SettingsManager.Settings.NoFail.Value == NoFailMode.NoMeter || IsPractice)
             {
                 _failMeter.SetActive(false);
             }
@@ -241,15 +259,17 @@ namespace YARG.Gameplay
             {
                 EngineManager.OnSongFailed += OnSongFailed;
 
-                EngineManager.InitializeHappiness();
-
-                SettingsManager.Settings.NoFailMode.OnChange += OnNoFailModeChanged;
+                SettingsManager.Settings.NoFail.OnChange += OnNoFailModeChanged;
                 SettingsManager.Settings.AutoCalibrateAudio.Value = false;
                 SettingsManager.Settings.AutoCalibrateVideo.Value = false;
             }
 
+            var noFail = ReplayData?.NoFail ?? SettingsManager.Settings.NoFail.Value != NoFailMode.Off;
+            EngineManager.InitializeHappiness(noFail);
+
             EngineManager.OnCodaStart += StartCoda;
             EngineManager.OnCodaEnd += EndCoda;
+            EngineManager.OnUnisonPhraseSuccess += OnUnisonPhraseSuccess;
 
             // Log constant values
             YargLogger.LogFormatDebug("Audio calibration: {0}, video calibration: {1}, song offset: {2}",
@@ -259,6 +279,18 @@ namespace YARG.Gameplay
             enabled = true;
             IsSongStarted = true;
             _songStarted?.Invoke();
+        }
+
+        private void ApplySampleNormalization()
+        {
+            double multiplier = SettingsManager.Settings.EnableNormalization.Value
+                ? NORMALIZED_SAMPLE_VOLUME_MULTIPLIER
+                : DEFAULT_SAMPLE_VOLUME_MULTIPLIER;
+
+            GlobalAudioHandler.SetVolumeMultiplier(SongStem.Sfx, multiplier);
+            GlobalAudioHandler.SetVolumeMultiplier(SongStem.DrumSfx, multiplier);
+            GlobalAudioHandler.SetVolumeMultiplier(SongStem.VoxSample, multiplier);
+            GlobalAudioHandler.SetVolumeMultiplier(SongStem.Metronome, multiplier);
         }
 
         private bool LoadReplay()
@@ -450,8 +482,11 @@ namespace YARG.Gameplay
                         // Initialize the vocal track if it hasn't been already, and hide lyric bar
                         if (!vocalTrackInitialized)
                         {
+                            highwayIndex++;
                             VocalTrack.gameObject.SetActive(true);
-                            _trackViewManager.CreateVocalTrackView();
+                            // Position the vocal track at its highway slot so the shader's WorldPosToIndex maps it correctly
+                            VocalTrack.transform.position = new Vector3(highwayIndex * TRACK_SPACING_X, 100, 0);
+                            _trackViewManager.CreateVocalTrackView(highwayIndex);
 
                             // Since all players have to select the same vocals
                             // type (solo/harmony) this works no problem.
@@ -478,22 +513,27 @@ namespace YARG.Gameplay
                     }
 
                     // Add (or increase total of) the stem state
-                    var stem = player.Profile.CurrentInstrument.ToSongStem();
-                    if (stem == SongStem.Bass && !_stemStates.ContainsKey(SongStem.Bass))
+                    var hasStem = false;
+                    foreach (var stem in player.Profile.CurrentInstrument.ToSongStems())
                     {
-                        stem = SongStem.Rhythm;
+                        var transformedStem = stem;
+                        if (stem == SongStem.Bass && !_stemStates.ContainsKey(SongStem.Bass))
+                        {
+                            transformedStem = SongStem.Rhythm;
+                        }
+                        if (transformedStem != _backgroundStem && _stemStates.TryGetValue(transformedStem, out var state))
+                        {
+                            hasStem = true;
+                            ++state.Total;
+                            ++state.Audible;
+                        }
                     }
 
-                    if (stem != _backgroundStem && _stemStates.TryGetValue(stem, out var state))
-                    {
-                        ++state.Total;
-                        ++state.Audible;
-                    }
-                    else if (_stemStates.TryGetValue(_backgroundStem, out state))
+                    if (!hasStem && _stemStates.TryGetValue(_backgroundStem, out var bgState))
                     {
                         // Ensures the stem will still play at a minimum of 50%, even if all players mute
-                        state.Total += 2;
-                        state.Audible += 2;
+                        bgState.Total += 2;
+                        bgState.Audible += 2;
                     }
                 }
             }

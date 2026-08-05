@@ -1,9 +1,8 @@
-using System.Linq;
 using Cysharp.Text;
 using UnityEngine;
 using YARG.Core.Game;
 using YARG.Core.Song;
-using YARG.Menu.Persistent;
+using YARG.Helpers;
 using YARG.Player;
 using YARG.Playlists;
 using YARG.Scores;
@@ -34,8 +33,8 @@ namespace YARG.Menu.MusicLibrary
 
         private bool _fetchedScores;
         private PlayerScoreRecord _playerScoreRecord;
-        private PlayerScoreRecord _playerPercentRecord;
         private GameRecord _bandScoreRecord;
+        private ScoreContext _fetchedScoreContext;
 
         public SongViewType(MusicLibraryMenu musicLibrary, SongEntry songEntry, string context = "library")
         {
@@ -81,9 +80,9 @@ namespace YARG.Menu.MusicLibrary
                 return string.Empty;
             }
 
-            var percentColor = _playerPercentRecord.IsFc ? "#ffd029" : "#ffffff";
+            var scoreColor = _playerScoreRecord.IsFc ? "#ffd029" : "#ffffff";
             builder.AppendFormat("<mspace=.5em><color={1}>{0:N0}</color></mspace>",
-                _playerScoreRecord.Score, percentColor);
+                _playerScoreRecord.Score, scoreColor);
             return builder.ToString();
         }
 
@@ -101,9 +100,9 @@ namespace YARG.Menu.MusicLibrary
             {
                 Score = _playerScoreRecord.Score,
                 Difficulty = _playerScoreRecord.Difficulty,
-                Percent = _playerPercentRecord.GetPercent(),
+                Percent = _playerScoreRecord.GetPercent(),
                 Instrument = _playerScoreRecord.Instrument,
-                IsFc = _playerPercentRecord.IsFc
+                IsFc = _playerScoreRecord.IsFc
             };
         }
 
@@ -111,12 +110,28 @@ namespace YARG.Menu.MusicLibrary
         {
             FetchHighScores();
 
-            if (_bandScoreRecord is not null)
+            return GetStarAmount(_playerScoreRecord, _bandScoreRecord);
+        }
+
+        public static StarAmount? GetStarAmountForSong(SongEntry songEntry)
+        {
+            FetchHighScores(songEntry, out var playerScoreRecord, out var bandScoreRecord);
+
+            return GetStarAmount(playerScoreRecord, bandScoreRecord);
+        }
+
+#nullable enable
+        private static StarAmount? GetStarAmount(
+            PlayerScoreRecord? playerScoreRecord,
+            GameRecord? bandScoreRecord)
+#nullable disable
+        {
+            if (bandScoreRecord is not null)
             {
-                return _bandScoreRecord.BandStars;
+                return bandScoreRecord.BandStars;
             }
 
-            return _playerScoreRecord?.Stars;
+            return playerScoreRecord?.Stars;
         }
 
         public override FavoriteInfo GetFavoriteInfo()
@@ -197,26 +212,21 @@ namespace YARG.Menu.MusicLibrary
 
         private void FetchHighScores()
         {
-            if (_fetchedScores)
+            var context = ScoreContext.Capture();
+            if (_fetchedScores && _fetchedScoreContext.Equals(context))
             {
                 return;
             }
 
+            FetchHighScores(SongEntry, out _playerScoreRecord, out _bandScoreRecord);
+            _fetchedScoreContext = context;
             _fetchedScores = true;
+        }
 
-            var humanCount = PlayerContainer.Players.Count(p => !p.Profile.IsBot);
-            if (humanCount == 1)
-            {
-                var player = PlayerContainer.Players.First(e => !e.Profile.IsBot);
-                _playerScoreRecord = ScoreContainer.GetHighScore(
-                    SongEntry.Hash, player.Profile.Id, player.Profile.CurrentInstrument);
-                _playerPercentRecord = ScoreContainer.GetBestPercentageScore(
-                    SongEntry.Hash, player.Profile.Id, player.Profile.CurrentInstrument);
-            }
-            else
-            {
-                _bandScoreRecord = ScoreContainer.GetBandHighScore(SongEntry.Hash);
-            }
+        private static void FetchHighScores(SongEntry songEntry, out PlayerScoreRecord playerScoreRecord, out GameRecord bandScoreRecord)
+        {
+            ScoreContainer.GetPreferredHighScoresForCurrentPlayers(
+                songEntry.Hash, out playerScoreRecord, out bandScoreRecord);
         }
     }
 }
