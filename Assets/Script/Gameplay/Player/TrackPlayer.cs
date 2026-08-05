@@ -1,7 +1,9 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Linq;
+using Cysharp.Threading.Tasks;
 using UnityEngine;
+using UnityEngine.Serialization;
 using YARG.Assets.Script.Helpers;
 using YARG.Core;
 using YARG.Core.Audio;
@@ -42,6 +44,8 @@ namespace YARG.Gameplay.Player
         protected HighwayCameraRendering HighwayCameraRendering;
         [SerializeField]
         protected TrackMaterial TrackMaterial;
+        [SerializeField]
+        protected StrikelineAnimator StrikelineAnimator;
         [SerializeField]
         protected ComboMeter ComboMeter;
         [SerializeField]
@@ -186,6 +190,10 @@ namespace YARG.Gameplay.Player
         private List<Phrase> _brePhrases = new();
         private int _breIndex;
 
+        private List<EngineManager.UnisonPhrase> _unisonPhrases = new();
+        private int                              _unisonStartIndex;
+        private int                              _unisonEndIndex;
+
         protected SongChart Chart;
 
         private AutoCalibrator _autoCalibrator;
@@ -229,8 +237,7 @@ namespace YARG.Gameplay.Player
             var events = NoteTrack.TextEvents;
 
             Engine = CreateEngine();
-
-            base.ComboMeter.Initialize(player.EnginePreset, Engine.BaseParameters.MaxMultiplier);
+            base.ComboMeter.Initialize(player.EnginePreset, Engine.BaseParameters.MaxMultiplier, GameManager.Players.Count > 1);
 
             Engine.OnComboIncrement += OnComboIncrement;
             Engine.OnComboReset += OnComboReset;
@@ -249,11 +256,10 @@ namespace YARG.Gameplay.Player
                 Engine.SetSpeed(GameManager.SongSpeed);
             }
 
-            GameManager.BeatEventHandler.Audio.Subscribe(MetronomeTick, BeatEventType.Measure);
-            GameManager.BeatEventHandler.Audio.Subscribe(MetronomeTock, BeatEventType.QuarterNote);
             GameManager.BeatEventHandler.Visual.Subscribe(SunburstEffects.PulseSunburst, BeatEventType.StrongBeat);
             InitializeTrackEffects();
             InitializeCodaEvents();
+            InitializeUnisonEvents();
 
             ResetNoteCounters();
 
@@ -266,8 +272,6 @@ namespace YARG.Gameplay.Player
 
         protected override void FinishDestruction()
         {
-            GameManager.BeatEventHandler.Audio.Unsubscribe(MetronomeTick);
-            GameManager.BeatEventHandler.Audio.Unsubscribe(MetronomeTock);
             GameManager.BeatEventHandler.Visual.Unsubscribe(SunburstEffects.PulseSunburst);
 
             _autoCalibrator?.Dispose();
@@ -284,6 +288,13 @@ namespace YARG.Gameplay.Player
                     _brePhrases.Add(phrase);
                 }
             }
+        }
+
+        private void InitializeUnisonEvents()
+        {
+            _unisonStartIndex = 0;
+            _unisonEndIndex = 0;
+            _unisonPhrases = EngineContainer.UnisonPhrases;
         }
 
         private void InitializeTrackEffects()
@@ -325,7 +336,7 @@ namespace YARG.Gameplay.Player
 
             phrases.AddRange(EngineContainer.UnisonPhrases);
 
-            var effects = TrackEffect.PhrasesToEffects(phrases);
+            var effects = TrackEffect.PhrasesToEffects(Notes, phrases);
             _trackEffects.AddRange(effects);
         }
 
@@ -356,6 +367,9 @@ namespace YARG.Gameplay.Player
             TrackMaterial.Initialize(Player.HighwayPreset);
             CameraPositioner.Initialize(Player.CameraPreset);
             FinalizeTrackEffects();
+
+            GameManager.EngineManager.OnPlayerFailed += OnPlayerFailed;
+            GameManager.EngineManager.OnPlayerRevived += OnPlayerRevived;
         }
 
         protected void ResetNoteCounters()
@@ -377,15 +391,33 @@ namespace YARG.Gameplay.Player
             BeatlineIndex = 0;
             ResetNoteCounters();
 
+            ResetTrackEffectOverlay(0);
+
             CurrentCoda = null;
             _breIndex = 0;
+            _unisonStartIndex = 0;
+            _unisonEndIndex = 0;
+
+            ResetLastHitTimes();
 
             base.ResetPracticeSection();
         }
 
-        public override void Rewind(double visualTime)
+        protected virtual void ResetLastHitTimes()
         {
 
+        }
+
+        public override void Rewind(double visualTime)
+        {
+            for (int index = NotePool.AllSpawned.Count - 1; index >= 0; index--)
+            {
+                var poolable = NotePool.AllSpawned[index];
+                if (poolable is INoteElement note)
+                {
+                    note.OnRewind();
+                }
+            }
         }
 
         public override void PostRewind(double visualTime)
@@ -402,6 +434,7 @@ namespace YARG.Gameplay.Player
             UpdateBeatlines(visualTime);
             UpdateTrackEffects(visualTime);
             UpdateCodaEvents(visualTime);
+            UpdateUnisonEvents(visualTime);
 
             var stats = Engine.BaseStats;
 
@@ -456,11 +489,6 @@ namespace YARG.Gameplay.Player
 
             _previousBassGrooveState = currentBassGrooveState;
 
-            if (!stats.IsStarPowerActive && _previousStarPowerAmount < 0.5 && currentStarPowerAmount >= 0.5)
-            {
-                TrackView.ShowStarPowerReady();
-            }
-
             if (stats.IsStarPowerActive && !_wasStarPowerActive && !_didLowerTrack)
             {
                 CameraPositioner.Scoop();
@@ -480,6 +508,11 @@ namespace YARG.Gameplay.Player
             {
                 _didLowerTrack = true;
                 CameraPositioner.Lower(isSongEnd);
+            }
+            else if (_didLowerTrack && !shouldLowerTrack)
+            {
+                _didLowerTrack = false;
+                CameraPositioner.Raise(false);
             }
         }
 
@@ -568,6 +601,21 @@ namespace YARG.Gameplay.Player
             }
         }
 
+        private void UpdateUnisonEvents(double time)
+        {
+            if (_unisonStartIndex < _unisonPhrases.Count && _unisonPhrases[_unisonStartIndex].Time <= time)
+            {
+                OnUnisonStart();
+                _unisonStartIndex++;
+            }
+
+            if (_unisonEndIndex < _unisonPhrases.Count && _unisonPhrases[_unisonEndIndex].TimeEnd <= time)
+            {
+                OnUnisonEnd();
+                _unisonEndIndex++;
+            }
+        }
+
         private void UpdateTrackEffects(double time)
         {
             if (_upcomingEffects.TryPeek(out var nextEffect) && nextEffect.Time <= time + SpawnTimeOffset)
@@ -584,7 +632,8 @@ namespace YARG.Gameplay.Player
             // drum fill visibility, it shouldn't break.
             for (var i = 0; i < _currentEffects.Count; i++)
             {
-                if (!_currentEffects[i].Active)
+                var trackEffectElement = _currentEffects[i];
+                if (!trackEffectElement.Active)
                 {
                     _currentEffects.RemoveAt(i);
                 }
@@ -593,31 +642,45 @@ namespace YARG.Gameplay.Player
                     // See if it's an invisible drum fill and if starpower has become available
                     // Since we never change visibility on anything but drum fills, there's no need to check
                     // the effect type.
-                    // TODO: We also need to change effects that were originally a UnisonAndDrumFill or SoloAndDrumFill
-                    //  back from Unison or Solo, although I'm not even sure those exist. Maybe SoloAndDrumFill does..
-                    if ((_currentEffects[i].Visibility < 1.0f && Engine.CanStarPowerActivate) && !Engine.BaseStats.IsStarPowerActive)
+                    if ((trackEffectElement.Visibility < 1.0f && Engine.CanStarPowerActivate) && !Engine.BaseStats.IsStarPowerActive)
                     {
-                        _currentEffects[i].MakeVisible();
+                        trackEffectElement.MakeVisible();
                         // If start transition is disabled, previous should be disabled
-                        if (!_currentEffects[i].EffectRef.StartTransitionEnable)
+                        if (!trackEffectElement.EffectRef.StartTransitionEnable && i > 0)
                         {
                             _currentEffects[i - 1].SetEndTransitionVisible(false);
                         }
 
                         // If end transition is disabled, next should be disabled if it is spawned
-                        if (_currentEffects.Count > i + 1 && !_currentEffects[i].EffectRef.EndTransitionEnable)
+                        if (_currentEffects.Count > i + 1 && !trackEffectElement.EffectRef.EndTransitionEnable)
                         {
                             _currentEffects[i + 1].SetStartTransitionVisible(false);
                         }
                     }
                     // We also need to make already spawned drum fills disappear if the player activated SP
                     // And we do need to check effect type here
-                    if (_currentEffects[i].EffectRef.EffectType == TrackEffectType.DrumFill &&
-                        (_currentEffects[i].Visibility == 1.0f && Engine.BaseStats.IsStarPowerActive))
+                    if (trackEffectElement.EffectRef.EffectType == TrackEffectType.DrumFill &&
+                        (trackEffectElement.Visibility == 1.0f && Engine.BaseStats.IsStarPowerActive))
                     {
-                        _currentEffects[i].MakeVisible(false);
+                        if (trackEffectElement.EffectRef.OriginalEffectType == TrackEffectType.DrumFillAndUnison)
+                        {
+                            // Turn this into a unison
+                            trackEffectElement.EffectRef.EffectType = TrackEffectType.Unison;
+                            SwapEffect(trackEffectElement);
+                            return;
+                        }
 
-                        if (!_currentEffects[i].EffectRef.StartTransitionEnable && i > 0)
+                        if (trackEffectElement.EffectRef.OriginalEffectType == TrackEffectType.SoloAndDrumFill)
+                        {
+                            // Turn this into a solo
+                            trackEffectElement.EffectRef.EffectType = TrackEffectType.Solo;
+                            SwapEffect(trackEffectElement);
+                            return;
+                        }
+
+                        trackEffectElement.MakeVisible(false);
+
+                        if (!trackEffectElement.EffectRef.StartTransitionEnable && i > 0)
                         {
                             // Previous maybe needs end transition enabled since we're disappearing
                             // (if the effect type doesn't have an end transition set, it won't
@@ -625,7 +688,7 @@ namespace YARG.Gameplay.Player
                             _currentEffects[i - 1].SetEndTransitionVisible(true);
                         }
 
-                        if (!_currentEffects[i].EffectRef.EndTransitionEnable)
+                        if (!trackEffectElement.EffectRef.EndTransitionEnable)
                         {
                             // next needs start transition enabled, if it is spawned
                             // if it isn't yet spawned, it should already be set correctly
@@ -637,6 +700,14 @@ namespace YARG.Gameplay.Player
                     }
                 }
             }
+        }
+
+        private static async void SwapEffect(TrackEffectElement trackEffectElement)
+        {
+            await trackEffectElement.MakeVisibleAsync(false);
+            trackEffectElement.Reinitialize();
+            // ReSharper disable once MethodHasAsyncOverload
+            trackEffectElement.MakeVisible(true);
         }
 
         private void SpawnEffect(TrackEffect nextEffect, bool seeking)
@@ -745,9 +816,9 @@ namespace YARG.Gameplay.Player
             SpawnLanesFromNote(parentNote);
         }
 
-        private void SpawnLanesFromNote(TNote parentNote)
+        protected virtual void SpawnLanesFromNote(TNote parentNote)
         {
-            if (!Engine.LanesExist || !Engine.BaseParameters.EnableLanes)
+            if (!Engine.BaseParameters.EnableLanes)
             {
                 return;
             }
@@ -789,14 +860,12 @@ namespace YARG.Gameplay.Player
 
                         if (childNote.IsLane)
                         {
-                            if (laneStartNotes.ContainsKey(childNote.LaneNote))
-                            {
-                                laneEndTimes[childNote.LaneNote] = noteRef.Time;
-                            }
-                            else
+                            if (!laneStartNotes.ContainsKey(childNote.LaneNote))
                             {
                                 laneStartNotes[childNote.LaneNote] = childNote;
                             }
+
+                            laneEndTimes[childNote.LaneNote] = noteRef.Time;
                         }
                     }
 
@@ -893,6 +962,9 @@ namespace YARG.Gameplay.Player
 
             BeatlineIndex = 0;
 
+            // Removed by EngineManager
+            EngineContainer = null;
+
             Engine = CreateEngine();
 
             if (GameManager.IsPractice)
@@ -965,12 +1037,12 @@ namespace YARG.Gameplay.Player
         {
             if (!Player.Profile.IsBot)
             {
-                _autoCalibrator.RecordAccuracy(note.Time);
+                _autoCalibrator.RecordAccuracy(Engine.CurrentTime, note.Time);
             }
 
             if (!GameManager.IsSeekingReplay)
             {
-                SetStemMuteState(false);
+                UpdateMuteState(note, false);
                 if (_currentMultiplier != _previousMultiplier)
                 {
                     _previousMultiplier = _currentMultiplier;
@@ -1007,7 +1079,7 @@ namespace YARG.Gameplay.Player
 
             if (!GameManager.IsSeekingReplay)
             {
-                SetStemMuteState(true);
+                UpdateMuteState(note, true);
 
                 if (LastCombo >= 10)
                 {
@@ -1040,6 +1112,11 @@ namespace YARG.Gameplay.Player
             LastCombo = Combo;
         }
 
+        protected virtual void UpdateMuteState(TNote note, bool isMuted)
+        {
+            SetStemMuteState(isMuted);
+        }
+
         protected virtual void OnSoloStart(SoloSection solo)
         {
             TrackView.StartSolo(solo);
@@ -1063,13 +1140,23 @@ namespace YARG.Gameplay.Player
         protected virtual void OnCodaStart(CodaSection coda)
         {
             CurrentCoda = coda;
-            CurrentCoda.SetLaneIndexes(GetLaneIndexes());
             SetStemMuteState(false);
+            TrackView.StartCoda();
         }
 
         protected virtual void OnCodaEnd(CodaSection coda)
         {
+            TrackView.EndCoda();
+        }
 
+        private void OnUnisonStart()
+        {
+            TrackView.StartUnison();
+        }
+
+        private void OnUnisonEnd()
+        {
+            TrackView.EndUnison();
         }
 
         protected virtual void OnCountdownChange(double countdownLength, double endTime)
@@ -1093,6 +1180,52 @@ namespace YARG.Gameplay.Player
             OnStarPowerPhraseHit();
         }
 
+        protected override void OnStarPowerReady()
+        {
+            base.OnStarPowerReady();
+            TrackView.ShowStarPowerReady();
+        }
+
+        protected void OnHappinessOverFail()
+        {
+            TrackMaterial.FailState = 0f;
+        }
+
+        protected void OnHappinessNearFail()
+        {
+            if (SettingsManager.Settings.NoFail.Value == NoFailMode.Off && !GameManager.IsPractice)
+            {
+                TrackMaterial.FailState = 1f;
+            }
+        }
+
+        protected void OnPlayerFailed(int engineId)
+        {
+            if (SettingsManager.Settings.NoFail.Value != NoFailMode.Off
+                || engineId != EngineContainer.EngineId
+                || GameManager.IsPractice)
+            {
+                // Not for us
+                return;
+            }
+
+            // Mark as failed and lower highway
+            PlayerHasFailed = true;
+            CameraPositioner.Lower(false);
+        }
+
+        protected void OnPlayerRevived()
+        {
+            if (!PlayerHasFailed)
+            {
+                return;
+            }
+
+            // Unfail and raise highway
+            PlayerHasFailed = false;
+            CameraPositioner.Raise(false);
+        }
+
         public override void GameplayUpdate()
         {
             base.GameplayUpdate();
@@ -1104,25 +1237,12 @@ namespace YARG.Gameplay.Player
             }
         }
 
-        public void MetronomeTick()
+        protected override void GameplayDestroy()
         {
-            GlobalAudioHandler.PlayMetronomeSoundEffect(SettingsManager.Settings.MetronomeSound.Value, MetronomePitch.Hi);
-        }
+            base.GameplayDestroy();
 
-        public void MetronomeTock()
-        {
-            GlobalAudioHandler.PlayMetronomeSoundEffect(SettingsManager.Settings.MetronomeSound.Value, MetronomePitch.Lo);
-        }
-
-        protected virtual Dictionary<int, int> GetLaneIndexes()
-        {
-            var indexDict = new Dictionary<int, int>();
-            for (int i = 0; i < LaneCount; i++)
-            {
-                indexDict[i] = i;
-            }
-
-            return indexDict;
+            GameManager.EngineManager.OnPlayerFailed -= OnPlayerFailed;
+            GameManager.EngineManager.OnPlayerRevived -= OnPlayerRevived;
         }
     }
 }

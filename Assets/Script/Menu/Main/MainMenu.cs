@@ -35,12 +35,17 @@ namespace YARG.Menu.Main
 
                 _antiPiracyDialogShown = true;
             }
+
+            if (SettingsMenu.ConsumeOpenOnNextMenuLoad())
+            {
+                SettingsMenu.Instance.gameObject.SetActive(true);
+            }
         }
 
         private void OnEnable()
         {
             // Set navigation scheme
-            Navigator.Instance.PushScheme(new NavigationScheme(new()
+            _ = Navigator.Instance.PushScheme(new NavigationScheme(new()
             {
                 NavigationScheme.Entry.NavigateSelect,
                 NavigationScheme.Entry.NavigateUp,
@@ -81,6 +86,11 @@ namespace YARG.Menu.Main
         public void Profiles()
         {
             MenuManager.Instance.PushMenu(MenuManager.Menu.ProfileList);
+        }
+
+        public void Content()
+        {
+            MenuManager.Instance.PushMenu(MenuManager.Menu.Content);
         }
 
         public void Replays()

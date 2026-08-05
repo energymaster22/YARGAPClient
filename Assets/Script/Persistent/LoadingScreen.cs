@@ -22,19 +22,9 @@ namespace YARG
 
         public static bool IsActive => Instance.gameObject.activeSelf;
 
-        private void PreInitLipsync()
-        {
-            var _unused = YARG.Core.Chart.LipsyncGenerator.GenerateFromLyrics(new Core.Chart.LyricsTrack());
-            YargLogger.LogInfo("Initialized phoneme dictionary");
-        }
-
         private async void Start()
         {
             using var context = new LoadingContext();
-
-            // Initialize phoneme dictionary
-            var _ = UniTask.RunOnThreadPool(PreInitLipsync);
-
 
             // Load language
             try
@@ -65,25 +55,8 @@ namespace YARG
                 YargLogger.LogException(e);
             }
 
-            // Load song sources and icons
-            try
-            {
-                await SongSources.LoadSources(context);
-            }
-            catch (Exception ex)
-            {
-                YargLogger.LogException(ex);
-            }
-
-            // Load (sub)genre mappings
-            try
-            {
-                await Genrelizer.LoadGenreMappings(context);
-            }
-            catch (Exception ex)
-            {
-                YargLogger.LogException(ex);
-            }
+            // Load sources and genre mappings concurrently
+            await UpdateSourcesAndGenres(context);
 
             // Auto connect profiles, using the same order that they were previously connected.
             if (SettingsManager.Settings.ReconnectProfiles.Value)
@@ -95,8 +68,67 @@ namespace YARG
                 PlayerContainer.ClearProfileOrder();
             }
 
+            // Initialize phoneme dictionary (must load on main thread, parse on thread pool)
+            var cmudictAsset = Resources.Load<TextAsset>("cmudict");
+            if (cmudictAsset == null)
+            {
+                YargLogger.LogError("Failed to load cmudict.txt from Resources");
+            }
+            else
+            {
+                var dictText = cmudictAsset.text;
+                await UniTask.RunOnThreadPool(() =>
+                {
+                    YARG.Core.Chart.LipsyncGenerator.Initialize(dictText);
+                    YargLogger.LogInfo("Initialized phoneme dictionary");
+                });
+            }
+
             // Fast scan (cache read) on startup
             await SongContainer.RunRefresh(true, context);
+        }
+
+        private static async UniTask UpdateSourcesAndGenres(LoadingContext context)
+        {
+            var tasks = new List<string> { "Song Sources", "Genres" };
+            context.SetLoadingText("Updating Song Sources and Genres...");
+
+            RefreshText();
+
+            try
+            {
+                await UniTask.WhenAll(
+                    TaskWrapper(SongSources.LoadSources(), "Song Sources"),
+                    TaskWrapper(Genrelizer.LoadGenreMappings(), "Genres")
+                    );
+            }
+            catch (Exception ex)
+            {
+                YargLogger.LogException(ex);
+            }
+
+            return;
+
+            async UniTask TaskWrapper(UniTask task, string name)
+            {
+                try
+                {
+                    await task;
+                }
+                finally
+                {
+                    tasks.Remove(name);
+                    RefreshText();
+                }
+            }
+
+            void RefreshText()
+            {
+                if (tasks.Count > 0)
+                {
+                    context.SetSubText(string.Join(", ", tasks));
+                }
+            }
         }
 
         private void Quit()
@@ -176,6 +208,7 @@ namespace YARG
             if (!_disposed)
             {
                 await Wait();
+                GlobalVariables.RestartProfileMicrophones();
                 LoadingScreen.Instance.gameObject.SetActive(false);
                 Navigator.Instance.DisableMenuInputs = false;
                 _disposed = true;

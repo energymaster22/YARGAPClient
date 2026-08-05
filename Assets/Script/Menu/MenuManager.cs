@@ -17,6 +17,7 @@ namespace YARG.Menu
             ProfileList,
             ProfileInfo,
             History,
+            Content,
         }
 
         /// <summary>
@@ -26,7 +27,8 @@ namespace YARG.Menu
         private static readonly HashSet<Menu> _allowedLastOpenMenus = new()
         {
             Menu.MusicLibrary,
-            Menu.History
+            Menu.History,
+            Menu.Content
         };
 
         /// <summary>
@@ -141,11 +143,16 @@ namespace YARG.Menu
             }
         }
 
-        public void ReactivateCurrentMenu()
+        public void ReactivateCurrentMenu(bool forceRefreshIfActive = true)
         {
             // Show the under one
             if (_openMenus.TryPeek(out var menu) && _menus.TryGetValue(menu, out var newMenu))
             {
+                if (!forceRefreshIfActive && newMenu.gameObject.activeSelf)
+                {
+                    return;
+                }
+
                 if (_reactivateCoroutine != null)
                 {
                     StopCoroutine(_reactivateCoroutine);

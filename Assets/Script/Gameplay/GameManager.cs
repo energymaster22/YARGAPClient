@@ -15,6 +15,7 @@ using YARG.Core.Replays.Analyzer;
 using YARG.Core.Song;
 using YARG.Gameplay.HUD;
 using YARG.Gameplay.Player;
+using YARG.Gameplay.Visuals;
 using YARG.Input;
 using YARG.Integration;
 using YARG.Localization;
@@ -43,6 +44,7 @@ namespace YARG.Gameplay
 
         public const float TRACK_SPACING_X = 100f;
 
+
         public bool IsSeekingReplay;
 
         [Header("References")]
@@ -62,6 +64,9 @@ namespace YARG.Gameplay
         private FailMeter _failMeter;
 
         [SerializeField]
+        private UnisonDisplay _unisonDisplay;
+
+        [SerializeField]
         private BREBox _breBox;
 
         [field: SerializeField]
@@ -79,6 +84,7 @@ namespace YARG.Gameplay
         public bool IsSongStarted { get; private set; } = false;
 
         private SongRunner _songRunner;
+        private float _appliedSongSpeed = float.NaN;
 
         /// <remarks>
         /// This is not initialized on awake, but rather, in
@@ -101,9 +107,6 @@ namespace YARG.Gameplay
         /// <inheritdoc cref="SongRunner.SongTime"/>
         public double SongTime => _songRunner.SongTime;
 
-        /// <inheritdoc cref="SongRunner.AudioTime"/>
-        public double AudioTime => _songRunner.AudioTime;
-
         /// <inheritdoc cref="SongRunner.VisualTime"/>
         public double VisualTime => _songRunner.VisualTime;
 
@@ -112,6 +115,9 @@ namespace YARG.Gameplay
 
         /// <inheritdoc cref="SongRunner.SongSpeed"/>
         public float SongSpeed => _songRunner.SongSpeed;
+
+        /// <inheritdoc cref="SongRunner.IsAudioSyncCorrectionActive"/>
+        public bool IsAudioSyncCorrectionActive => _songRunner.IsAudioSyncCorrectionActive;
 
         /// <inheritdoc cref="SongRunner.Started"/>
         public bool Started => _songRunner.Started;
@@ -142,11 +148,7 @@ namespace YARG.Gameplay
             set => EngineManager.Combo = value;
         }
 
-        public float BandStars
-        {
-            get => EngineManager.Stars;
-            set => EngineManager.Stars = value;
-        }
+        public float BandStars => EngineManager.Stars;
 
         public int BandMultiplier => EngineManager.BandMultiplier;
 
@@ -164,9 +166,10 @@ namespace YARG.Gameplay
 
         private bool _isReplaySaved;
         private int _originalSleepTimeout;
-        private bool _breBoxActive;
 
         private StemMixer _mixer;
+        private MetronomeScheduler _metronomeScheduler;
+        private CrowdClapScheduler _crowdClapScheduler;
 
         private List<double> _frameTimes;
 
@@ -236,23 +239,37 @@ namespace YARG.Gameplay
             }
 
             // Unsubscribe from other events
-            SettingsManager.Settings.NoFailMode.OnChange -= OnNoFailModeChanged;
+            SettingsManager.Settings.NoFail.OnChange -= OnNoFailModeChanged;
             EngineManager.OnSongFailed -= OnSongFailed;
             EngineManager.OnCodaStart -= StartCoda;
             EngineManager.OnCodaEnd -= EndCoda;
+            EngineManager.OnUnisonPhraseSuccess -= OnUnisonPhraseSuccess;
 
-            //Restore stem volumes to their original state
+            // Stop playback-owned work before teardown callbacks touch the mixer or UI.
+            _metronomeScheduler?.Dispose();
+            _crowdClapScheduler?.Dispose();
+            _songRunner?.Dispose();
+
+            // Restore stem volumes to their original state while the mixer is still valid.
             foreach (var (stem, state) in _stemStates)
             {
                 GlobalAudioHandler.SetVolumeSetting(stem, state.Volume);
             }
 
             DisposeDebug();
-            _pauseMenu.PopAllMenus();
+
+            // Scene teardown can destroy this object before GameManager.OnDestroy runs.
+            if (_pauseMenu != null)
+            {
+                _pauseMenu.PopAllMenus();
+            }
+
+            // Crowd teardown stops SFX through GlobalAudioHandler, so it must happen while audio is initialized.
+            CrowdEventHandler?.Dispose();
+
             _mixer?.Dispose();
-            _songRunner?.Dispose();
+
             BackgroundManager.Dispose();
-            CrowdEventHandler.Dispose();
 
             // Reset the time scale back, as it would be 0 at this point (because of pausing)
             Time.timeScale = 1f;
@@ -263,6 +280,7 @@ namespace YARG.Gameplay
 
         private void Update()
         {
+
             Assets.Script.Yarchipelago.Events.OnSongUpdate(this, _pauseMenu);
 
             // Pause/unpause
@@ -293,21 +311,27 @@ namespace YARG.Gameplay
                 return;
             }
 
+            bool runnerWasStarted = _songRunner.Started;
+
             // Update handlers
             _songRunner.Update();
+            if (!runnerWasStarted && _songRunner.Started)
+            {
+                GlobalVariables.RestartProfileMicrophones();
+            }
+
+            ApplySongSpeed();
             BeatEventHandler.Update(_songRunner.SongTime, _songRunner.VisualTime);
             CrowdEventHandler.Update(_songRunner.SongTime);
 
             // Update players
             int totalScore = 0;
-            float totalStars = 0f;
             foreach (var player in _players)
             {
                 player.GameplayUpdate();
 
                 totalScore += player.Score;
                 totalScore += player.BandBonusScore;
-                totalStars += player.Stars;
             }
 
             if (GlobalVariables.VerboseReplays)
@@ -316,7 +340,7 @@ namespace YARG.Gameplay
             }
 
             BandScore = totalScore;
-            BandStars = totalStars / _players.Count;
+            EngineManager.UpdateStars();
 
             // End song if needed (required for the [end] event)
             if (_songRunner.SongTime >= SongLength)
@@ -328,9 +352,11 @@ namespace YARG.Gameplay
             }
         }
 
+
         public void SetSongTime(double time, double delayTime = SONG_START_DELAY)
         {
             _songRunner.SetSongTime(time, delayTime);
+            ApplySongSpeed();
 
             BeatEventHandler.Reset();
             BackgroundManager.SetTime(_songRunner.SongTime + Song.SongOffsetSeconds);
@@ -340,13 +366,17 @@ namespace YARG.Gameplay
             {
                 _lyricBar.SetSongTime(time);
             }
+
+            if (_unisonDisplay.gameObject.activeSelf)
+            {
+                _unisonDisplay.SetSongTime(time);
+            }
         }
 
         public void SetSongSpeed(float speed)
         {
             _songRunner.SetSongSpeed(speed);
-
-            BackgroundManager.SetSpeed(_songRunner.SongSpeed);
+            ApplySongSpeed();
         }
 
         public int GetMixerFFTData(float[] buffer, int fftSize, bool complex)
@@ -363,18 +393,37 @@ namespace YARG.Gameplay
         {
             _songRunner.AdjustSongSpeed(deltaSpeed);
 
-            // Only scale the player speed in practice
-            if (IsPractice && _songRunner.SongSpeed >= 1)
+            ApplySongSpeed();
+        }
+
+        public void AdjustSongSpeedInPlace(float deltaSpeed)
+        {
+            _songRunner.AdjustSongSpeedInPlace(deltaSpeed);
+
+            ApplySongSpeed();
+        }
+
+        private void ApplySongSpeed()
+        {
+            float speed = _songRunner.SongSpeed;
+            if (Mathf.Approximately(speed, _appliedSongSpeed))
             {
-                // Scale only if the speed is greater than 1
-                var speed = _songRunner.SongSpeed >= 1 ? _songRunner.SongSpeed : 1;
+                return;
+            }
+
+            _appliedSongSpeed = speed;
+
+            // Only scale the player speed in practice.
+            if (IsPractice && _players != null)
+            {
+                float engineSpeed = speed >= 1 ? speed : 1;
                 foreach (var player in _players)
                 {
-                    player.BaseEngine.SetSpeed(speed);
+                    player.BaseEngine.SetSpeed(engineSpeed);
                 }
             }
 
-            BackgroundManager.SetSpeed(_songRunner.SongSpeed);
+            BackgroundManager.SetSpeed(speed);
         }
 
         public void Pause(bool showMenu = true)
@@ -443,7 +492,7 @@ namespace YARG.Gameplay
 
         public bool PlayerHasFailed { get; set; } = false;
 
-        public async void Resume()
+        public async void Resume(double? rewindDuration = null)
         {
             // We don't rewind in practice mode or in replay, so we can skip all the BS
             if (IsPractice || IsReplay)
@@ -489,8 +538,12 @@ namespace YARG.Gameplay
                 currentPause.PauseLength = InputManager.InputUpdateTime - _pauseTime;
                 PauseInfo[^1] = currentPause;
 
-                // Don't allow rewinding past the rewind limit
-                var rewindSeconds = Math.Max(0, SongTime - _rewindLimit);
+                // Don't allow rewinding past the rewind limit, unless a duration was explicitly passed to the resume function
+                var rewindSeconds = Math.Max(0, rewindDuration ?? SongTime - _rewindLimit);
+                if (rewindSeconds == PAUSE_REWIND_LENGTH)
+                {
+                    GlobalAudioHandler.PlaySoundEffect(SfxSample.Rewind);
+                }
 
                 var canceled = await RewindAndResume(rewindSeconds);
 
@@ -581,13 +634,14 @@ namespace YARG.Gameplay
             return resumed;
         }
 
-        public double GetRelativeInputTime(double timeFromInputSystem)
-            => _songRunner.GetRelativeInputTime(timeFromInputSystem);
+        public double GetInputTime(double inputSystemTime)
+            => _songRunner.GetInputTime(inputSystemTime);
 
         private bool EndSong()
         {
+            _crowdClapScheduler?.Dispose();
             // Dispose the crowd handler
-            CrowdEventHandler.Dispose();
+            CrowdEventHandler?.Dispose();
 
             if (IsPractice)
             {
@@ -626,9 +680,7 @@ namespace YARG.Gameplay
                     IsHighScore = player.Score > player.LastHighScore,
                     Player = player.Player,
                     Stats = player.BaseStats,
-                    AverageMultiplier = player.BaseEngine.BaseScore == 0 ?
-                        0 :
-                        (float) player.BaseStats.StarScore / player.BaseEngine.BaseScore
+                    IsReplay = player.Player.IsReplay
                 }).ToArray(),
                 BandScore = BandScore,
                 BandStars = (int) BandStars,
@@ -656,7 +708,7 @@ namespace YARG.Gameplay
 
             // Get all of the individual player score entries
             var playerEntries = new List<PlayerScoreRecord>();
-
+            var starScoreCutoffsList = new List<int[]>();
             foreach (var player in _players)
             {
                 var profile = player.Player.Profile;
@@ -686,6 +738,8 @@ namespace YARG.Gameplay
 
                     Percent = player.BaseStats.Percent
                 });
+
+                starScoreCutoffsList.Add(player.BaseEngine.StarScoreThresholds);
             }
 
             var validScoreCount = _players.Count(p => ScoreContainer.IsSoloScoreValid(SongSpeed, p.Player));
@@ -695,7 +749,8 @@ namespace YARG.Gameplay
             }
 
             int humanBandScore = 0;
-            float humanBandStars = 0f;
+            float humanBandStars = 0;
+            int humanCount = playerEntries.Count;
             if (HasBots && SaveScoresWithBots)
             {
                 // Simulate the replay with only human players to calculate the correct score.
@@ -704,12 +759,24 @@ namespace YARG.Gameplay
                 {
                     return;
                 }
-
                 var results = ReplayAnalyzer.AnalyzeReplay(Chart, replayInfo, ReplayData);
                 foreach (var result in results)
                 {
                     humanBandScore += result.ResultStats.TotalScore + result.ResultStats.BandBonusScore;
-                    humanBandStars += result.ResultStats.Stars;
+                }
+                var humanStarScoreCutoffs = EngineManager.GetStarScoreCutoffs(starScoreCutoffsList);
+                // Determine where in the cutoffs humanBandScore is
+                // Iterating backwards is slightly faster assuming people are good at the game
+                for (int i = humanStarScoreCutoffs.Length - 1; i >= 0; i--)
+                {
+                    if (humanBandScore >= humanStarScoreCutoffs[i])
+                    {
+                        // This gives humanBandStars as an int, which is not exactly correct but should make no difference
+                        // since it is converted into StarAmount by int anyway
+                        humanBandStars = i + 1;
+                        YargLogger.LogFormatDebug("Star count: {0}", humanBandStars);
+                        break;
+                    }
                 }
             }
             else
@@ -718,15 +785,12 @@ namespace YARG.Gameplay
                 foreach (var player in _players)
                 {
                     humanBandScore += player.Score + player.BaseStats.BandBonusScore;
-                    humanBandStars += player.Stars;
                 }
+                humanBandStars = EngineManager.Stars;
             }
 
-            // Calculate band stars by taking average stars for human players only
-            int humanCount = playerEntries.Count;
-            int averageStars = (int)(humanBandStars / humanCount);
             var bandStars = humanCount > 0
-                ? StarAmountHelper.GetStarsFromInt(averageStars)
+                ? StarAmountHelper.GetStarsFromInt(Mathf.FloorToInt(humanBandStars))
                 : StarAmount.None;
 
             ScoreContainer.RecordScore(new GameRecord
@@ -759,11 +823,13 @@ namespace YARG.Gameplay
         public void SetVenueCameraManager(CameraManager cameraManager)
         {
             VenueCameraManager = cameraManager;
+            InitializeCameraDebug();
         }
 
         public void SetVenueCharacterManager(CharacterManager characterManager)
         {
             VenueCharacterManager = characterManager;
+            InitializeCharacterDebug();
         }
 
         public void SetEditHUD(bool on)
@@ -793,9 +859,10 @@ namespace YARG.Gameplay
             var replayStats = new List<ReplayStats>(_players.Count);
             var colorProfiles = new Dictionary<Guid, ColorProfile>();
             var cameraPresets = new Dictionary<Guid, CameraPreset>();
+            var rockMeterPresets = new Dictionary<Guid, RockMeterPreset>();
 
             int bandScore = 0;
-            float bandStars = 0f;
+            float bandStars = EngineManager.Stars;
             for (int i = 0; i < _players.Count; i++)
             {
                 var player = _players[i];
@@ -808,7 +875,6 @@ namespace YARG.Gameplay
                 frames.Add(frame);
                 replayStats.Add(stats);
                 bandScore += player.Score;
-                bandStars += player.Stars;
 
                 if (!player.Player.ColorProfile.DefaultPreset)
                 {
@@ -819,6 +885,11 @@ namespace YARG.Gameplay
                 {
                     cameraPresets.TryAdd(player.Player.CameraPreset.Id, player.Player.CameraPreset);
                 }
+
+                if (!player.Player.RockMeterPreset.DefaultPreset)
+                {
+                    rockMeterPresets.TryAdd(player.Player.RockMeterPreset.Id, player.Player.RockMeterPreset);
+                }
             }
 
             if (frames.Count == 0)
@@ -826,8 +897,9 @@ namespace YARG.Gameplay
                 return null;
             }
 
-            var stars = StarAmountHelper.GetStarsFromInt((int) (bandStars / frames.Count));
-            ReplayData = new ReplayData(colorProfiles, cameraPresets, frames.ToArray(), _frameTimes.ToArray());
+            var noFail = SettingsManager.Settings.NoFail.Value != NoFailMode.Off;
+            var stars = StarAmountHelper.GetStarsFromInt(Mathf.FloorToInt(bandStars));
+            ReplayData = new ReplayData(colorProfiles, cameraPresets, rockMeterPresets, noFail, frames.ToArray(), _frameTimes.ToArray());
 
             (bool success, var replayInfo) = ReplayIO.TrySerialize(directory, Song, SongSpeed, length, bandScore, stars, PauseInfo.ToArray(), replayStats.ToArray(), ReplayData);
             if (!success)
@@ -887,7 +959,7 @@ namespace YARG.Gameplay
 
         private async void OnSongFailed()
         {
-            if (SettingsManager.Settings.NoFailMode.Value || IsPractice)
+            if (SettingsManager.Settings.NoFail.Value != NoFailMode.Off || IsPractice)
             {
                 return;
             }
@@ -895,6 +967,15 @@ namespace YARG.Gameplay
             if (!PlayerHasFailed)
             {
                 PlayerHasFailed = true;
+
+                if (_players.Count > 1)
+                {
+                    // For some reason you seem to need this many frames to pass before pause for every highway to lower?
+                    await UniTask.DelayFrame(_players.Count - 1);
+                }
+
+                // Pause gameplay immediately, but don't show the menu until the highways have lowered
+                _songRunner.Pause();
                 FlagDeathLink();
                 _mixer.FadeOut(SONG_END_DELAY);
                 await UniTask.Delay(TimeSpan.FromSeconds(SONG_END_DELAY));
@@ -903,18 +984,31 @@ namespace YARG.Gameplay
             }
         }
 
+        public void UnfailSong()
+        {
+            YargLogger.LogFormatDebug("Unfailing song at SongTime {0}", SongTime);
+            PlayerHasFailed = false;
+            EngineManager.RevivePlayer();
+            EngineManager.NoFailChanged(true);
+            _mixer.FadeIn(DEFAULT_VOLUME, SONG_START_DELAY);
+            InvalidateScores("Menu.Toast.ResumeAfterFailInvalidate");
+            // This is an arbitrary value, just want to give players enough time to adjust
+            Resume(SONG_START_DELAY + 1);
+        }
         // If we go from no fail to fail, we need to reinitialize the happiness state so we avoid
         // the possibility of an instant fail. Yes, this is cheeseable since toggling no fail resets happiness.
-        private void OnNoFailModeChanged(bool noFail)
+        private void OnNoFailModeChanged(NoFailMode mode)
         {
-            // If we're going from no fail to fail and happiness would result in an insta-fail, reset happiness,
-            // but also inhibit score saving to avoid cheesing
-            if (!noFail && EngineManager.Happiness <= 0f)
+            // If we're going from no fail to fail and happiness would result in a player being in the red, reset happiness
+            if (mode == NoFailMode.Off && EngineManager.GetLowestHappiness()?.Happiness <= 0.333f)
             {
-                InvalidateScores("Menu.Toast.NoFailScore");
-
-                EngineManager.InitializeHappiness();
+                EngineManager.InitializeHappiness(false);
             }
+
+            InvalidateScores("Menu.Toast.NoFailScore");
+
+            EngineManager.NoFailChanged(mode != NoFailMode.Off);
+            _failMeter.SetActive(mode != NoFailMode.NoMeter);
         }
 
         internal void InvalidateScores(string toastKey)
@@ -970,6 +1064,11 @@ namespace YARG.Gameplay
         {
             YargLogger.LogFormatDebug("Rewinding {0} seconds at VisualTime {1}", seconds, VisualTime);
 
+            if (_lyricBar.gameObject.activeSelf)
+            {
+                _lyricBar.Rewind(VisualTime - seconds, 0.5f);
+            }
+
             // Rewind players
             foreach (var player in _players)
             {
@@ -999,26 +1098,28 @@ namespace YARG.Gameplay
             return false;
         }
 
+        private void OnUnisonPhraseSuccess()
+        {
+            if (_unisonDisplay.gameObject.activeSelf)
+            {
+                _unisonDisplay.OnUnisonPhraseSuccess();
+            }
+        }
+
         public void StartCoda(CodaSection _)
         {
-            if (_breBoxActive)
-            {
-                return;
-            }
-
-            _breBoxActive = true;
             _breBox.StartCoda(EngineManager);
         }
 
         public void EndCoda(CodaSection coda)
         {
-            _breBox.EndCoda(EngineManager.TotalCodaBonus, () => { _breBoxActive = false; });
+            var songEnding = SongTime >= LastNoteTime;
+            _breBox.EndCoda(EngineManager.TotalCodaBonus, songEnding, null);
         }
 
         public void ResetCoda()
         {
             _breBox.ForceReset();
-            _breBoxActive = false;
         }
     }
 }

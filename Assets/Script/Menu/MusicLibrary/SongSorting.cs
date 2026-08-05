@@ -1,21 +1,20 @@
-﻿using System;
-using System.Collections.Generic;
-using System.IO;
-using System.Linq;
-using System.Text;
+﻿using System.Collections.Generic;
 using System.Threading.Tasks;
 using YARG.Core;
 using YARG.Core.Extensions;
-using YARG.Core.IO;
-using YARG.Core.Logging;
 using YARG.Core.Song;
 using YARG.Core.Utility;
+using YARG.Helpers;
+using YARG.Helpers.Extensions;
+using YARG.Settings;
 using static YARG.Core.Song.SongEntrySorting;
 
 namespace YARG.Menu.MusicLibrary
 {
     public static class SongSorting
     {
+        private static bool DisallowedByRating(SongRating rating) => rating > SettingsManager.Settings.MaxSongRating.Value;
+
         private readonly struct ArtistComparer : IComparer<SongEntry>
         {
             public static readonly ArtistComparer Instance = default;
@@ -153,11 +152,39 @@ namespace YARG.Menu.MusicLibrary
             }
         }
 
+        private readonly struct AggregateDrumsComparer : IComparer<SongEntry>
+        {
+            private readonly int _intensity;
+
+            public AggregateDrumsComparer(int intensity)
+            {
+                _intensity = intensity;
+            }
+
+            public readonly int Compare(SongEntry lhs, SongEntry rhs)
+            {
+                int otherIntensity = GetPreferredIntensity(rhs);
+                if (_intensity == otherIntensity)
+                {
+                    return MetadataComparer.Instance.Compare(lhs, rhs);
+                }
+
+                return _intensity != -1 && (otherIntensity == -1 || _intensity < otherIntensity)
+                    ? -1 : 1;
+            }
+
+            private static int GetPreferredIntensity(SongEntry entry)
+            {
+                var instrument = MidiDrumkitHelper.GetPreferredInstrumentForSong(entry);
+                return instrument.HasValue ? entry[instrument.Value].Intensity : -1;
+            }
+        }
+
         private static readonly unsafe delegate*<SongCache, SortedSongs, void>[] SORTERS =
         {
-            &SortByTitle,    &SortByArtist,   &SortByAlbum,  &SortByGenre,       &SortBySubgenre,   &SortByYear,
-            &SortByCharter,  &SortByPlaylist, &SortBySource, &SortByArtistAlbum, &SortByLength,     &SortByDateAdded,
-            &SortByInstruments
+            &SortByTitle,       &SortByArtist,   &SortByAlbum,  &SortByGenre,       &SortBySubgenre,   &SortByYear,
+            &SortByCharter,     &SortByPlaylist, &SortBySource, &SortByArtistAlbum, &SortByLength,     &SortByDateAdded,
+            &SortByInstruments, &SortByAggregateDrums
         };
 
         internal static unsafe void SortEntries(SongCache cache, SortedSongs sorted)
@@ -172,6 +199,11 @@ namespace YARG.Menu.MusicLibrary
             {
                 foreach (var entry in list.Value)
                 {
+                    if (DisallowedByRating(entry.SongRating))
+                    {
+                        continue;
+                    }
+
                     string name = entry.Name.Group switch
                     {
                         CharacterGroup.Empty or
@@ -186,7 +218,7 @@ namespace YARG.Menu.MusicLibrary
                     }
 
                     int index = category.BinarySearch(entry, MetadataComparer.Instance);
-                    category.Insert(~index, entry);
+                    category.SafeInsert(~index, entry);
                 }
             }
         }
@@ -197,6 +229,11 @@ namespace YARG.Menu.MusicLibrary
             {
                 foreach (var entry in list.Value)
                 {
+                    if (DisallowedByRating(entry.SongRating))
+                    {
+                        continue;
+                    }
+
                     var artist = entry.Artist;
                     if (!sorted.Artists.TryGetValue(artist, out var category))
                     {
@@ -204,7 +241,7 @@ namespace YARG.Menu.MusicLibrary
                     }
 
                     int index = category.BinarySearch(entry, MetadataComparer.Instance);
-                    category.Insert(~index, entry);
+                    category.SafeInsert(~index, entry);
                 }
             }
         }
@@ -215,6 +252,11 @@ namespace YARG.Menu.MusicLibrary
             {
                 foreach (var entry in list.Value)
                 {
+                    if (DisallowedByRating(entry.SongRating))
+                    {
+                        continue;
+                    }
+
                     var album = entry.Album;
                     if (!sorted.Albums.TryGetValue(album, out var category))
                     {
@@ -222,7 +264,7 @@ namespace YARG.Menu.MusicLibrary
                     }
 
                     int index = category.BinarySearch(entry, AlbumComparer.Instance);
-                    category.Insert(~index, entry);
+                    category.SafeInsert(~index, entry);
                 }
             }
         }
@@ -233,6 +275,11 @@ namespace YARG.Menu.MusicLibrary
             {
                 foreach (var entry in list.Value)
                 {
+                    if (DisallowedByRating(entry.SongRating))
+                    {
+                        continue;
+                    }
+
                     var genre = entry.Genre;
                     if (!sorted.Genres.TryGetValue(genre, out var category))
                     {
@@ -240,7 +287,7 @@ namespace YARG.Menu.MusicLibrary
                     }
 
                     int index = category.BinarySearch(entry, MetadataComparer.Instance);
-                    category.Insert(~index, entry);
+                    category.SafeInsert(~index, entry);
                 }
             }
         }
@@ -251,6 +298,11 @@ namespace YARG.Menu.MusicLibrary
             {
                 foreach (var entry in list.Value)
                 {
+                    if (DisallowedByRating(entry.SongRating))
+                    {
+                        continue;
+                    }
+
                     var subgenre = string.IsNullOrEmpty(entry.Subgenre) ? entry.Genre : entry.Subgenre;
 
                     if (!sorted.Subgenres.TryGetValue(subgenre, out var category))
@@ -259,7 +311,7 @@ namespace YARG.Menu.MusicLibrary
                     }
 
                     int index = category.BinarySearch(entry, MetadataComparer.Instance);
-                    category.Insert(~index, entry);
+                    category.SafeInsert(~index, entry);
                 }
             }
         }
@@ -270,6 +322,11 @@ namespace YARG.Menu.MusicLibrary
             {
                 foreach (var entry in list.Value)
                 {
+                    if (DisallowedByRating(entry.SongRating))
+                    {
+                        continue;
+                    }
+
                     string year = entry.YearAsNumber != int.MaxValue ? entry.ParsedYear[..^1] + "0s" : entry.ParsedYear;
                     if (!sorted.Years.TryGetValue(year, out var category))
                     {
@@ -277,7 +334,7 @@ namespace YARG.Menu.MusicLibrary
                     }
 
                     int index = category.BinarySearch(entry, YearComparer.Instance);
-                    category.Insert(~index, entry);
+                    category.SafeInsert(~index, entry);
                 }
             }
         }
@@ -288,6 +345,11 @@ namespace YARG.Menu.MusicLibrary
             {
                 foreach (var entry in list.Value)
                 {
+                    if (DisallowedByRating(entry.SongRating))
+                    {
+                        continue;
+                    }
+
                     var charter = entry.Charter;
                     if (!sorted.Charters.TryGetValue(charter, out var category))
                     {
@@ -295,7 +357,7 @@ namespace YARG.Menu.MusicLibrary
                     }
 
                     int index = category.BinarySearch(entry, MetadataComparer.Instance);
-                    category.Insert(~index, entry);
+                    category.SafeInsert(~index, entry);
                 }
             }
         }
@@ -306,6 +368,11 @@ namespace YARG.Menu.MusicLibrary
             {
                 foreach (var entry in list.Value)
                 {
+                    if (DisallowedByRating(entry.SongRating))
+                    {
+                        continue;
+                    }
+
                     var playlist = entry.Playlist;
                     if (!sorted.Playlists.TryGetValue(playlist, out var category))
                     {
@@ -313,7 +380,7 @@ namespace YARG.Menu.MusicLibrary
                     }
 
                     int index = category.BinarySearch(entry, PlaylistComparer.Instance);
-                    category.Insert(~index, entry);
+                    category.SafeInsert(~index, entry);
                 }
             }
         }
@@ -324,6 +391,11 @@ namespace YARG.Menu.MusicLibrary
             {
                 foreach (var entry in list.Value)
                 {
+                    if (DisallowedByRating(entry.SongRating))
+                    {
+                        continue;
+                    }
+
                     var source = entry.Source;
                     if (!sorted.Sources.TryGetValue(source, out var category))
                     {
@@ -331,7 +403,7 @@ namespace YARG.Menu.MusicLibrary
                     }
 
                     int index = category.BinarySearch(entry, MetadataComparer.Instance);
-                    category.Insert(~index, entry);
+                    category.SafeInsert(~index, entry);
                 }
             }
         }
@@ -342,6 +414,11 @@ namespace YARG.Menu.MusicLibrary
             {
                 foreach (var entry in list.Value)
                 {
+                    if (DisallowedByRating(entry.SongRating))
+                    {
+                        continue;
+                    }
+
                     // constants represents upper milliseconds limit of each range
                     string range = entry.SongLengthMilliseconds switch
                     {
@@ -359,7 +436,7 @@ namespace YARG.Menu.MusicLibrary
                     }
 
                     int index = category.BinarySearch(entry, LengthComparer.Instance);
-                    category.Insert(~index, entry);
+                    category.SafeInsert(~index, entry);
                 }
             }
         }
@@ -370,6 +447,11 @@ namespace YARG.Menu.MusicLibrary
             {
                 foreach (var entry in list.Value)
                 {
+                    if (DisallowedByRating(entry.SongRating))
+                    {
+                        continue;
+                    }
+
                     var dateAdded = entry.GetLastWriteTime().Date;
                     if (!sorted.DatesAdded.TryGetValue(dateAdded, out var category))
                     {
@@ -377,7 +459,7 @@ namespace YARG.Menu.MusicLibrary
                     }
 
                     int index = category.BinarySearch(entry, MetadataComparer.Instance);
-                    category.Insert(~index, entry);
+                    category.SafeInsert(~index, entry);
                 }
             }
         }
@@ -388,6 +470,11 @@ namespace YARG.Menu.MusicLibrary
             {
                 foreach (var entry in list.Value)
                 {
+                    if (DisallowedByRating(entry.SongRating))
+                    {
+                        continue;
+                    }
+
                     var artist = entry.Artist;
                     if (!sorted.ArtistAlbums.TryGetValue(artist, out var albums))
                     {
@@ -401,7 +488,7 @@ namespace YARG.Menu.MusicLibrary
                     }
 
                     int index = category.BinarySearch(entry, AlbumComparer.Instance);
-                    category.Insert(~index, entry);
+                    category.SafeInsert(~index, entry);
                 }
             }
         }
@@ -416,29 +503,65 @@ namespace YARG.Menu.MusicLibrary
                 {
                     foreach (var entry in list.Value)
                     {
-                        var part = entry[instrument];
-                        if (part.IsActive())
+                        if (DisallowedByRating(entry.SongRating))
                         {
-                            if (intensities == null)
-                            {
-                                lock (sorted.Instruments)
-                                {
-                                    sorted.Instruments.Add(instrument, intensities = new SortedDictionary<int, List<SongEntry>>());
-                                }
-                            }
-
-                            if (!intensities.TryGetValue(part.Intensity, out var category))
-                            {
-                                intensities.Add(part.Intensity, category = new List<SongEntry>());
-                            }
-
-                            int index = category.BinarySearch(entry, new InstrumentComparer(instrument, part.Intensity));
-                            category.Insert(~index, entry);
+                            continue;
                         }
+
+                        int intensity;
+                        var part = entry[instrument];
+
+                        if (!part.IsActive()) continue;
+
+                        intensity = part.Intensity;
+
+                        if (intensities == null)
+                        {
+                            lock (sorted.Instruments)
+                            {
+                                sorted.Instruments.Add(instrument, intensities = new SortedDictionary<int, List<SongEntry>>());
+                            }
+                        }
+
+                        if (!intensities.TryGetValue(intensity, out var category))
+                        {
+                            intensities.Add(intensity, category = new List<SongEntry>());
+                        }
+
+                        IComparer<SongEntry> comparer = new InstrumentComparer(instrument, intensity);
+
+                        int index = category.BinarySearch(entry, comparer);
+                        category.SafeInsert(~index, entry);
                     }
                 }
             });
         }
-        #nullable restore
+
+        private static void SortByAggregateDrums(SongCache cache, SortedSongs sorted)
+        {
+            var intensities = sorted.AggregateDrums;
+            foreach (var list in cache.Entries)
+            {
+                foreach (var entry in list.Value)
+                {
+                    if (DisallowedByRating(entry.SongRating))
+                    {
+                        continue;
+                    }
+
+                    var preferredInstrument = MidiDrumkitHelper.GetPreferredInstrumentForSong(entry);
+                    if (!preferredInstrument.HasValue) continue;
+
+                    int intensity = entry[preferredInstrument.Value].Intensity;
+
+                    if (!intensities.TryGetValue(intensity, out var category))
+                        intensities.Add(intensity, category = new List<SongEntry>());
+
+                    IComparer<SongEntry> comparer = new AggregateDrumsComparer(intensity);
+                    int index = category.BinarySearch(entry, comparer);
+                    category.SafeInsert(~index, entry);
+                }
+            }
+        }
     }
 }

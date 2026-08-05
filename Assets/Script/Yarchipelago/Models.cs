@@ -197,15 +197,15 @@ namespace YARG.Assets.Script.Yarchipelago
                 {
                     Name = array[0].ToObject<string>(),
                     Loc1Id = array[1].ToObject<long>(),
-                    Loc2Id = array[2].ToObject<long>(),
-                    Loc3Id = array[3].ToObject<long>(),
-                    ItemId = array[4].ToObject<long>(),
-                    Source = array[5].ToObject<string>(),
-                    Artist = array[6].ToObject<string>()
+                    Source = array[2].ToObject<string>(),
+                    Artist = array[3].ToObject<string>()
                 };
+                result.Loc2Id = result.Loc1Id + 1;
+                result.Loc3Id = result.Loc1Id + 2;
+                result.ItemId = (result.Loc3Id / 3) + 11; // 11 is how many static items there are, I hate to magic number this but not really an easier way to get it.
 
-                if (array.Count > 7)
-                    result.Instrument = array[7].ToObject<string>();
+                if (array.Count > 4)
+                    result.Instrument = array[4].ToObject<string>();
                 else
                     result.Instrument = null;
 

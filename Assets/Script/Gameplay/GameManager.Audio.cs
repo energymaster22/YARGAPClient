@@ -70,7 +70,10 @@ namespace YARG.Gameplay
                     SongStem.Rhythm    => SettingsManager.Settings.RhythmVolume.Value,
                     SongStem.Bass      => SettingsManager.Settings.BassVolume.Value,
                     SongStem.Keys      => SettingsManager.Settings.KeysVolume.Value,
-                    SongStem.Drums     => SettingsManager.Settings.DrumsVolume.Value,
+                    SongStem.Drums1    => SettingsManager.Settings.DrumsVolume.Value,
+                    SongStem.Drums2    => SettingsManager.Settings.DrumsVolume.Value,
+                    SongStem.Drums3    => SettingsManager.Settings.DrumsVolume.Value,
+                    SongStem.Drums4    => SettingsManager.Settings.DrumsVolume.Value,
                     SongStem.Vocals    => SettingsManager.Settings.VocalsVolume.Value,
                     SongStem.Song      => SettingsManager.Settings.SongVolume.Value,
                     SongStem.Crowd     => SettingsManager.Settings.CrowdVolume.Value,
@@ -100,8 +103,7 @@ namespace YARG.Gameplay
             _backgroundStem = SongStem.Song;
             foreach (var channel in _mixer.Channels)
             {
-                var stemState = new StemState(channel.Stem);
-                _stemStates.Add(channel.Stem, stemState);
+                _stemStates.TryAdd(channel.Stem, new StemState(channel.Stem));
             }
 
             _backgroundStem = _stemStates.Count > 1 ? SongStem.Song : _stemStates.First().Key;

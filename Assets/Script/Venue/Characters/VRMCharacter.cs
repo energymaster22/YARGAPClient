@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using DG.Tweening;
+using UniGLTF.SpringBoneJobs.Blittables;
 using UnityEngine;
 using UniVRM10;
 using YARG.Core.Chart;
@@ -32,9 +33,13 @@ namespace YARG.Venue.Characters
         [SerializeField]
         [Tooltip("Set to true if you have the full set of RB expressions implemented.\n\nOtherwise, lipsync will only use the selected VRM default expression key.")]
         private bool _useFullLipsync;
+        [SerializeField]
+        [Tooltip("Set to true if you want to use custom animations instead of the default ones.")]
+        public bool UseCustomAnimations;
 
-        private ExpressionKey _lipsyncKey;
-        private bool          _hasVrmInstance;
+        private ExpressionKey       _lipsyncKey;
+        private bool                _hasVrmInstance;
+        private BlittableModelLevel _modelLevels;
 
         private Vector3 _initialPosition;
 
@@ -51,6 +56,18 @@ namespace YARG.Venue.Characters
 
         private bool HasLipsyncEvents => _lipsyncEvents != null && _lipsyncEvents.Count > 0;
 
+        public int ActionsPerAnimationCycle
+        {
+            get => _actionsPerAnimationCycle;
+            set => _actionsPerAnimationCycle = value;
+        }
+
+        public int FramesToFirstHit
+        {
+            get => _framesToFirstHit;
+            set => _framesToFirstHit = value;
+        }
+
         private CameraManager _cameraManager;
 
         public override void Initialize(CharacterManager characterManager = null)
@@ -66,6 +83,7 @@ namespace YARG.Venue.Characters
             _characterManager = characterManager;
             VrmInstance = GetComponent<Vrm10Instance>();
             _hasVrmInstance = VrmInstance != null;
+            _modelLevels = new BlittableModelLevel();
             _expression = VrmInstance.Runtime.Expression;
 
             if (_characterManager != null)
@@ -138,40 +156,44 @@ namespace YARG.Venue.Characters
             if (TryGetExpressionKey(lipsyncEvent.Type.ToString(), out key))
             {
                 _expression.SetWeight(key, lipsyncEvent.Value);
+                return;
             }
+
+            _expression.SetWeight(_lipsyncKey, lipsyncEvent.Value);
         }
 
-        public override void OnNote<T>(Note<T> note)
+        public void SetWind(Vector3 wind)
         {
-            // If _useFullLipsync is set, we don't use the default expression or the note-based trigger
-            // ...unless the chart doesn't have lipsync events
-            if (!_hasVrmInstance || (_useFullLipsync && HasLipsyncEvents))
+            if (!_hasVrmInstance)
             {
                 return;
             }
 
-            if (note is VocalNote vocalNote)
-            {
-                // Animate in/out of expression for animLength time
-                float animLength = (float) vocalNote.TotalTimeLength * 0.1f;
-                float offDelay = (float) vocalNote.TotalTimeLength * 0.9f;
-
-                var currentWeight = _expression.GetWeight(_lipsyncKey);
-                DOVirtual.Float(currentWeight, 1f, animLength, x => _expression.SetWeight(_lipsyncKey, x))
-                    .SetAutoKill(true);
-                DOVirtual.DelayedCall(offDelay, () => ExpressionOff(_lipsyncKey, animLength));
-            }
+            //update external force
+            _modelLevels = new BlittableModelLevel(externalForce: wind,
+                stopSpringBoneWriteback: _modelLevels.StopSpringBoneWriteback,
+                supportsScalingAtRuntime: _modelLevels.SupportsScalingAtRuntime);
+            //push model level changes to VRM runtime
+            VrmInstance.Runtime.SpringBone.SetModelLevel(VrmInstance.transform, _modelLevels);
         }
 
-        private void ExpressionOff(ExpressionKey key, float length)
+        public void SetSpringPause(bool paused)
         {
-            if (length > 0)
+            if (!_hasVrmInstance)
             {
-                DOVirtual.Float(_expression.GetWeight(key), 0f, length, x => _expression.SetWeight(key, x)).SetAutoKill(true);
                 return;
             }
+            //set spring bone paused state
+            _modelLevels = new BlittableModelLevel(externalForce: _modelLevels.ExternalForce,
+                stopSpringBoneWriteback: paused,
+                supportsScalingAtRuntime: _modelLevels.SupportsScalingAtRuntime);
+            //push model level changes to VRM runtime
+            VrmInstance.Runtime.SpringBone.SetModelLevel(VrmInstance.transform, _modelLevels);
+        }
 
-            _expression.SetWeight(key, 0f);
+        public override void OnChartEvent(ChartEvent e)
+        {
+
         }
 
         private void SetupBoundsCheck()
