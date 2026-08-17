@@ -3,6 +3,7 @@ using System.Reflection;
 using TMPro;
 using UnityEngine;
 using UnityEngine.Events;
+using YARG.Localization;
 using YARG.Menu.Main;
 using YARG.Menu.Navigation;
 
@@ -36,6 +37,9 @@ namespace YARG.Assets.Script.Yarchipelago
             go.SetActive(true);
 
             var btn = go.GetComponent<NavigatableButton>();
+
+            var localizer = go.GetComponentInChildren<LocalizeText>(true);
+            if (localizer != null) UnityEngine.Object.Destroy(localizer);
 
             WipePersistentOnClick(btn);
             AddOnClick(btn, ArchipelagoConnectionDialog.ToggleArchipelagoDialog);
